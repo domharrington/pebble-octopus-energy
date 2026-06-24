@@ -1,0 +1,79 @@
+# Octopus Energy for Pebble
+
+A Pebble **watchapp** (not a watchface) that shows your home electricity usage as
+a bar chart, using the [Octopus Energy API](https://developer.octopus.energy/).
+Built with **Alloy** (Pebble's JavaScript framework, powered by Moddable XS).
+
+Targets **emery** (Pebble Time 2) and **gabbro** (Pebble Round 2).
+
+## Views & controls
+
+- **Live** — near-real-time watts from your Octopus **Home Mini** (GraphQL
+  `smartMeterTelemetry`), polled every ~30s *only while this view is open*.
+- **Day** — most recent day of hourly consumption (kWh). The REST feed lags
+  ~24–48h, so the latest day with data is shown, labelled with its date.
+- **Week / Month / Year** — kWh aggregated by day (week, month) or by month
+  (year), via the REST `group_by` parameter.
+
+Buttons: **UP/DOWN** cycle through the views · **SELECT** refreshes · **BACK** exits
+(which also stops live polling — its timer dies with the app).
+
+## Settings
+
+The app is **configurable** from the phone's Pebble app (gear icon → Settings).
+The page collects your API key, account number, and a demo-data toggle, and saves
+them to `localStorage` (the highest-priority config layer). The API key stays on
+the phone. The page is a self-contained `data:` URL, so no server is needed.
+
+## How it works
+
+```
+src/embeddedjs/main.js   Watch UI — Poco bar chart, view switching, live poll timer
+src/pkjs/index.js        Phone — Octopus REST + GraphQL, normalises, sends to watch
+src/pkjs/config.js       Committed config defaults (no secrets)
+src/pkjs/config.local.js Your personal secrets (gitignored, optional)
+```
+
+The phone side (`pkjs`) does all networking — **your API key never reaches the
+watch**. It distils the response to ~24 numbers and sends them over App Messages;
+the watch just draws.
+
+## Configuration
+
+Credentials resolve in this order (later layers win):
+
+1. **`config.js`** — committed defaults. Ships with `useMock: true` so the app
+   renders synthetic data with no credentials.
+2. **`config.local.js`** — your personal keys, gitignored. This is the
+   "local secrets" file for personal builds.
+3. **`localStorage["settings"]`** — written by an on-phone Settings page in a
+   future distributed build (see Roadmap).
+
+### Personal setup
+
+```sh
+cp src/pkjs/config.local.example.js src/pkjs/config.local.js
+# edit config.local.js: set apiKey, accountNumber, useMock: false
+```
+
+- **apiKey** — Octopus Dashboard → Developer settings → API access (`sk_live_…`)
+- **accountNumber** — e.g. `A-AB1234CD`
+
+The app auto-discovers your MPAN + meter serial (and Home Mini device ID) from
+the account; export/solar meter-points are skipped. The REST consumption feed
+lags ~24–48h, so the Day view shows the most recent day that has data.
+
+## Building & running
+
+```sh
+pebble build                       # build for all target platforms
+pebble install --emulator emery    # run in the Pebble Time 2 emulator
+pebble install --phone <ip>        # install to a paired phone
+pebble logs                        # view watch + pkjs console output
+```
+
+## Roadmap
+
+- **Gas** and **estimated cost** (£/p) — cost needs tariff unit-rates + standing
+  charge (and half-hourly rates for Cosy/Agile), so it's a follow-up.
+- Per-view axis labels for week/month/year.

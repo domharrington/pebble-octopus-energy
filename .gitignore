@@ -1,0 +1,6 @@
+build/
+node_modules/
+*.pbw
+.lock-waf_*
+pebble_screenshot_*.png
+src/pkjs/config.local.js

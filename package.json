@@ -1,0 +1,35 @@
+{
+  "name": "octopus-pebble",
+  "author": "MakeAwesomeHappen",
+  "version": "1.0.0",
+  "keywords": ["pebble-app"],
+  "private": true,
+  "dependencies": {},
+  "pebble": {
+    "displayName": "Octopus Energy",
+    "uuid": "71c60e0e-5e84-435e-92ab-5c19ec2a6ee0",
+    "projectType": "moddable",
+    "sdkVersion": "3",
+    "enableMultiJS": true,
+    "targetPlatforms": [
+      "emery",
+      "gabbro"
+    ],
+    "watchapp": {
+      "watchface": false
+    },
+    "capabilities": ["configurable"],
+    "messageKeys": [
+      "REQUEST",
+      "STATUS",
+      "LABEL",
+      "TOTAL",
+      "UNIT",
+      "BARS",
+      "ERROR"
+    ],
+    "resources": {
+      "media": []
+    }
+  }
+}
