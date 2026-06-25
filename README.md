@@ -95,6 +95,12 @@ The watch installs over Bluetooth via your phone:
 
 ## Roadmap
 
-- **Gas** and **estimated cost** (£/p) — cost needs tariff unit-rates + standing
-  charge (and half-hourly rates for Cosy/Agile), so it's a follow-up.
-- Per-view axis labels for week/month/year.
+- **Gas** alongside electricity (separate meter point / GraphQL filter).
+- **Publish to the appstore** (future) — sideloading works today; to get a store
+  listing with screenshots, via the [Rebble dev portal](https://dev-portal.rebble.io/):
+  1. Log in → *Add a Watchapp*; enter title, source URL, support email, category.
+  2. Upload large + small icons.
+  3. *Add a release* → upload the `.pbw` → publish the release.
+  4. Per platform, create an *Asset Collection*: description, up to 5 screenshots,
+     up to 3 header images, a marketing banner.
+  5. *Publish* (public or private) for a shareable appstore link.
