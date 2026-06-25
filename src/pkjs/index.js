@@ -1,20 +1,23 @@
 /*
  * Octopus Energy — phone-side (PebbleKit JS).
  *
- * Runs on your phone. Does all the networking (your API key never leaves the
- * phone), normalises the response to a tiny payload, and sends it to the watch
- * via App Messages.
+ * Does all networking and sends the watch a compact two-series payload:
+ *   track A = primary  (Live: watts · energy views: kWh)
+ *   track B = secondary (energy views: £; absent on Live)
+ * The watch toggles A/B with SELECT, so £/kWh switches instantly without re-fetch.
  *
- * Note on style: the pkjs bundler is ES5-only, so no async/await or arrow
- * functions here — but Promises work at runtime, so XHR is wrapped in a Promise
- * once and the logic reads as flat .then() chains instead of nested callbacks.
+ * Data sources (all GraphQL / Kraken — the same the Octopus app uses):
+ *   Live  -> smartMeterTelemetry  (ONE_MINUTE, last 30 min, Home Mini)
+ *   Day   -> smartMeterTelemetry  (HALF_HOURLY, today so far, with cost)
+ *   Week/Month/Year -> measurements (DAY/DAY/MONTH interval, with cost)
+ *
+ * Style note: the pkjs bundler is ES5-only (no async/await/arrow fns); Promises
+ * work at runtime, so XHR is wrapped once and logic reads as flat .then() chains.
  */
 
 /* ── Configuration ───────────────────────────────────────────────────────────
- * Don't put credentials here. Resolution order (highest priority last):
- *   1. config.js               committed defaults (mock mode, no secrets)
- *   2. config.local.js         gitignored personal keys (see config.local.example.js)
- *   3. localStorage "settings" written by the on-phone Settings page (distributed builds)
+ * Resolution order (highest priority last):
+ *   1. config.js   2. config.local.js (gitignored)   3. localStorage "settings"
  */
 function merge(target, src) {
   if (!src) return target;
@@ -25,268 +28,32 @@ function merge(target, src) {
   }
   return target;
 }
-
-// require() that returns {} instead of throwing when the module is absent,
-// so a fresh clone without config.local.js still builds and runs.
-function requireOptional(path) {
-  try { return require(path); } catch (e) { return {}; }
-}
-
+function requireOptional(path) { try { return require(path); } catch (e) { return {}; } }
 function loadConfig() {
   var cfg = { apiKey: "", accountNumber: "", useMock: true };
   try { merge(cfg, require("./config")); } catch (e) {}
   merge(cfg, requireOptional("./config.local"));
-  try {
-    var stored = localStorage.getItem("settings");
-    if (stored) merge(cfg, JSON.parse(stored));
-  } catch (e) {}
+  try { var s = localStorage.getItem("settings"); if (s) merge(cfg, JSON.parse(s)); } catch (e) {}
   return cfg;
 }
-
 var CONFIG = loadConfig();
-var BASE = "https://api.octopus.energy/v1";
-
-/* ── Auth ──────────────────────────────────────────────────────────────────── */
-// base64 (btoa isn't guaranteed in PebbleKit JS)
-function b64encode(input) {
-  var k = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=";
-  var out = "", c1, c2, c3, e1, e2, e3, e4, i = 0;
-  while (i < input.length) {
-    c1 = input.charCodeAt(i++); c2 = input.charCodeAt(i++); c3 = input.charCodeAt(i++);
-    e1 = c1 >> 2;
-    e2 = ((c1 & 3) << 4) | (c2 >> 4);
-    e3 = ((c2 & 15) << 2) | (c3 >> 6);
-    e4 = c3 & 63;
-    if (isNaN(c2)) { e3 = e4 = 64; } else if (isNaN(c3)) { e4 = 64; }
-    out += k.charAt(e1) + k.charAt(e2) + k.charAt(e3) + k.charAt(e4);
-  }
-  return out;
-}
-function authHeader() { return "Basic " + b64encode(CONFIG.apiKey + ":"); }
-
-/* ── HTTP (Promise-wrapped XHR) ───────────────────────────────────────────── */
-function httpGet(url) {
-  return new Promise(function (resolve, reject) {
-    var xhr = new XMLHttpRequest();
-    xhr.open("GET", url, true);
-    xhr.setRequestHeader("Authorization", authHeader());
-    xhr.timeout = 15000;
-    xhr.onload = function () { resolve({ status: xhr.status, body: xhr.responseText }); };
-    xhr.onerror = function () { reject(new Error("network error")); };
-    xhr.ontimeout = function () { reject(new Error("timed out")); };
-    xhr.send();
-  });
-}
-
-function getJSON(url) {
-  return httpGet(url).then(function (res) {
-    if (res.status === 401 || res.status === 403) throw new Error("Bad API key");
-    if (res.status !== 200) throw new Error("HTTP " + res.status);
-    return JSON.parse(res.body);
-  });
-}
-
-/* ── App messages ─────────────────────────────────────────────────────────── */
-function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
-
-function sendOnce(obj) {
-  return new Promise(function (resolve, reject) {
-    Pebble.sendAppMessage(obj, resolve, reject);
-  });
-}
-
-// Retry until the watch's channel accepts the message. The first attempt also
-// kicks off the AppMessage session handshake when the app has just launched.
-function sendReliable(obj) {
-  function attempt(n) {
-    return sendOnce(obj).catch(function () {
-      if (n <= 0) { console.log("octopus: gave up sending after retries"); return; }
-      return sleep(500).then(function () { return attempt(n - 1); });
-    });
-  }
-  return attempt(12);
-}
-
-/* ── Octopus data ─────────────────────────────────────────────────────────── */
-function getMeter() {
-  var cached = localStorage.getItem("meter_v2");
-  if (cached) return Promise.resolve(JSON.parse(cached));
-
-  return getJSON(BASE + "/accounts/" + encodeURIComponent(CONFIG.accountNumber) + "/").then(function (data) {
-    var props = data.properties || [];
-    var found = null;
-    for (var p = 0; p < props.length && !found; p++) {
-      var emps = props[p].electricity_meter_points || [];
-      for (var m = 0; m < emps.length && !found; m++) {
-        var meters = emps[m].meters || [];
-        // Skip export (solar) meter-points; we want import consumption.
-        if (emps[m].mpan && meters.length && !emps[m].is_export) {
-          found = { mpan: emps[m].mpan, serial: meters[0].serial_number };
-        }
-      }
-    }
-    if (!found) throw new Error("No electricity meter found");
-    localStorage.setItem("meter_v2", JSON.stringify(found));
-    console.log("octopus: meter mpan…" + found.mpan.slice(-4) + " serial…" + String(found.serial).slice(-4));
-    return found;
-  });
-}
-
-var MONTHS = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"];
-var WEEKDAYS = ["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"];
-
-// "2026-06-21" -> "SAT 21 JUN"
-function formatDateLabel(ymd) {
-  var parts = ymd.split("-");
-  var d = new Date(Number(parts[0]), Number(parts[1]) - 1, Number(parts[2]), 12, 0, 0);
-  return WEEKDAYS[d.getDay()] + " " + Number(parts[2]) + " " + MONTHS[Number(parts[1]) - 1];
-}
-
-// The REST feed lags ~24-48h, so instead of assuming "today" we fetch the most
-// recent hourly data and show the latest day that actually has readings.
-function fetchRecentDay(meter) {
-  var url = BASE + "/electricity-meter-points/" + meter.mpan + "/meters/" + meter.serial +
-    "/consumption/?group_by=hour&order_by=-period&page_size=72"; // ~3 days of hourly buckets
-
-  return getJSON(url).then(function (data) {
-    var results = data.results || []; // newest first
-    var byDate = {}, order = [];
-    for (var i = 0; i < results.length; i++) {
-      var iso = results[i].interval_start || "";
-      var ymd = iso.substr(0, 10);
-      var hh = parseInt(iso.substr(11, 2), 10);
-      if (!ymd || isNaN(hh)) continue;
-      if (!byDate[ymd]) { byDate[ymd] = []; for (var z = 0; z < 24; z++) byDate[ymd][z] = 0; order.push(ymd); }
-      byDate[ymd][hh] += Number(results[i].consumption) || 0;
-    }
-
-    // Pick the date with the most populated hours; ties resolve to the most
-    // recent (order is newest-first, and we only replace on a strictly higher count).
-    var best = null, bestCount = -1;
-    for (var d = 0; d < order.length; d++) {
-      var c = 0, hrs = byDate[order[d]];
-      for (var h = 0; h < 24; h++) if (hrs[h] > 0) c++;
-      if (c > bestCount) { bestCount = c; best = order[d]; }
-    }
-    console.log("octopus: recent day=" + best + " hoursWithData=" + bestCount + " daysSeen=" + order.length);
-    if (!best) return null;
-    return { label: formatDateLabel(best), hours: byDate[best] };
-  });
-}
-
-function sumHours(hours) {
-  var total = 0;
-  for (var j = 0; j < hours.length; j++) total += hours[j];
-  return total;
-}
-
-function sendDay(label, hours) {
-  var parts = [];
-  for (var i = 0; i < hours.length; i++) parts.push((hours[i] || 0).toFixed(3));
-  var total = sumHours(hours);
-  if (total === 0) return sendReliable({ STATUS: "nodata", LABEL: label });
-  return sendReliable({
-    STATUS: "ok",
-    LABEL: label,
-    TOTAL: total.toFixed(2),
-    UNIT: "kWh",
-    BARS: parts.join(",")
-  });
-}
-
-// Synthetic day with a morning peak, roughly like the app screenshots.
-function mockHours() {
-  return [0.12, 0.10, 0.09, 0.55, 0.30, 0.45, 0.95, 0.70, 0.40, 0.35, 0.30, 0.20,
-          0.18, 0.16, 0.15, 0.17, 0.22, 0.30, 0.42, 0.38, 0.30, 0.25, 0.20, 0.15];
-}
-
-// Aggregated buckets (week/month/year) via group_by. Returns the most recent
-// `count` buckets in chronological order as a kWh array.
-function fetchAggregate(meter, groupBy, count) {
-  var url = BASE + "/electricity-meter-points/" + meter.mpan + "/meters/" + meter.serial +
-    "/consumption/?group_by=" + groupBy + "&order_by=-period&page_size=" + (count + 3);
-  return getJSON(url).then(function (data) {
-    var results = (data.results || []).slice(0, count); // newest first
-    results.reverse(); // -> chronological
-    var bars = [];
-    for (var i = 0; i < results.length; i++) bars.push(Number(results[i].consumption) || 0);
-    return bars;
-  });
-}
-
-// view -> how to aggregate. "day" is handled separately (hourly, best recent day).
-var HISTORY = {
-  week:  { groupBy: "day",   count: 7,  label: "LAST 7 DAYS" },
-  month: { groupBy: "day",   count: 30, label: "LAST 30 DAYS" },
-  year:  { groupBy: "month", count: 12, label: "LAST 12 MONTHS" }
-};
-
-function mockBars(n, base) {
-  var out = [];
-  for (var i = 0; i < n; i++) out.push(base + ((i * 7) % 5) * base * 0.3);
-  return out;
-}
-
-var inFlight = false; // guards against overlapping/duplicate loads
-
-// Handles day/week/month/year.
-function loadHistory(view) {
-  if (inFlight) return;
-  inFlight = true;
-  function finish() { inFlight = false; }
-
-  var spec = HISTORY[view]; // undefined for "day"
-
-  if (CONFIG.useMock) {
-    if (view === "day") sendDay("TODAY (mock)", mockHours()).then(finish, finish);
-    else sendDay(spec.label + " (mock)", mockBars(spec.count, view === "year" ? 250 : 8)).then(finish, finish);
-    return;
-  }
-  if (!CONFIG.apiKey || !CONFIG.accountNumber) {
-    sendReliable({ STATUS: "error", ERROR: "Set API key in pkjs" }).then(finish, finish);
-    return;
-  }
-
-  sendOnce({ STATUS: "loading" }).catch(function () {}); // best-effort; also primes the session
-
-  getMeter().then(function (meter) {
-    if (view === "day") {
-      return fetchRecentDay(meter).then(function (day) {
-        if (!day) return sendReliable({ STATUS: "nodata", LABEL: "NO DATA" });
-        return sendDay(day.label, day.hours);
-      });
-    }
-    return fetchAggregate(meter, spec.groupBy, spec.count).then(function (bars) {
-      return sendDay(spec.label, bars);
-    });
-  }).catch(function (e) {
-    return sendReliable({ STATUS: "error", ERROR: String((e && e.message) || e) });
-  }).then(finish, finish);
-}
-
-function loadDay() { loadHistory("day"); }
-
-/* ── Live (Home Mini, GraphQL) ────────────────────────────────────────────── */
 var GRAPHQL = "https://api.octopus.energy/v1/graphql/";
 var krakenToken = null; // short-lived JWT, re-minted on auth failure
 
-function graphqlRaw(query, token) {
+/* ── GraphQL over Promise-wrapped XHR ─────────────────────────────────────── */
+function graphqlRaw(query, token, variables) {
   return new Promise(function (resolve, reject) {
     var xhr = new XMLHttpRequest();
     xhr.open("POST", GRAPHQL, true);
     xhr.setRequestHeader("Content-Type", "application/json");
     if (token) xhr.setRequestHeader("Authorization", token); // raw token, no prefix
-    xhr.timeout = 15000;
-    xhr.onload = function () {
-      try { resolve(JSON.parse(xhr.responseText)); }
-      catch (e) { reject(new Error("Bad GraphQL JSON")); }
-    };
+    xhr.timeout = 20000;
+    xhr.onload = function () { try { resolve(JSON.parse(xhr.responseText)); } catch (e) { reject(new Error("Bad GraphQL JSON")); } };
     xhr.onerror = function () { reject(new Error("network error")); };
     xhr.ontimeout = function () { reject(new Error("timed out")); };
-    xhr.send(JSON.stringify({ query: query }));
+    xhr.send(JSON.stringify({ query: query, variables: variables || {} }));
   });
 }
-
 function getToken() {
   if (krakenToken) return Promise.resolve(krakenToken);
   var q = 'mutation { obtainKrakenToken(input: {APIKey: "' + CONFIG.apiKey + '"}) { token } }';
@@ -296,16 +63,14 @@ function getToken() {
     return krakenToken;
   });
 }
-
-// Run an authenticated query; if the token has expired, re-mint once and retry.
-function graphqlQuery(query) {
+function graphqlQuery(query, variables) {
   return getToken().then(function (token) {
-    return graphqlRaw(query, token).then(function (res) {
+    return graphqlRaw(query, token, variables).then(function (res) {
       if (res.errors) {
         var msg = res.errors[0].message || "GraphQL error";
         if (/token|auth|signature|expire|jwt|permission/i.test(msg)) {
           krakenToken = null;
-          return getToken().then(function (t2) { return graphqlRaw(query, t2); }).then(function (r2) {
+          return getToken().then(function (t2) { return graphqlRaw(query, t2, variables); }).then(function (r2) {
             if (r2.errors) throw new Error(r2.errors[0].message);
             return r2.data;
           });
@@ -331,7 +96,6 @@ function getDevice() {
         var devs = meters[j].smartDevices || [];
         if (devs.length && devs[0].deviceId) {
           localStorage.setItem("device_v1", devs[0].deviceId);
-          console.log("octopus: home mini device …" + String(devs[0].deviceId).slice(-6));
           return devs[0].deviceId;
         }
       }
@@ -340,132 +104,226 @@ function getDevice() {
   });
 }
 
-function isoMinutesAgo(min) { return new Date(Date.now() - min * 60000).toISOString(); }
+/* ── App messages ─────────────────────────────────────────────────────────── */
+function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
+function sendOnce(obj) { return new Promise(function (resolve, reject) { Pebble.sendAppMessage(obj, resolve, reject); }); }
+function sendReliable(obj) {
+  function attempt(n) {
+    return sendOnce(obj).catch(function () {
+      if (n <= 0) { console.log("octopus: gave up sending"); return; }
+      return sleep(500).then(function () { return attempt(n - 1); });
+    });
+  }
+  return attempt(12);
+}
+// payload = { label, axis, a:{bars:[],total,unit}, b:{bars:[],total,unit}|null }
+function sendTracks(p) {
+  var msg = { STATUS: "ok", LABEL: p.label, AXIS: p.axis || "",
+    A_BARS: p.a.bars.join(","), A_TOTAL: p.a.total, A_UNIT: p.a.unit };
+  if (p.b) { msg.B_BARS = p.b.bars.join(","); msg.B_TOTAL = p.b.total; msg.B_UNIT = p.b.unit; }
+  return sendReliable(msg);
+}
+function fmt(n, dp) { return (Math.round(n * Math.pow(10, dp)) / Math.pow(10, dp)).toFixed(dp); }
 
-// demand (watts) over the last few minutes; latest reading is the headline number.
-function sendLive(points) {
-  if (!points.length) return sendReliable({ STATUS: "nodata", LABEL: "LIVE" });
-  var parts = [], i;
-  for (i = 0; i < points.length; i++) parts.push(String(Math.round(points[i])));
-  return sendReliable({
-    STATUS: "ok",
-    LABEL: "LIVE",
-    TOTAL: String(Math.round(points[points.length - 1])),
-    UNIT: "W",
-    BARS: parts.join(",")
+/* ── Date helpers (local time) ────────────────────────────────────────────── */
+function startOfToday() { var d = new Date(); return new Date(d.getFullYear(), d.getMonth(), d.getDate()); }
+function startOfWeek() { var d = new Date(); var diff = (d.getDay() + 6) % 7; return new Date(d.getFullYear(), d.getMonth(), d.getDate() - diff); }
+function startOfMonth() { var d = new Date(); return new Date(d.getFullYear(), d.getMonth(), 1); }
+function startOfYear() { var d = new Date(); return new Date(d.getFullYear(), 0, 1); }
+var WD = ["S", "M", "T", "W", "T", "F", "S"];
+var MO = ["J", "F", "M", "A", "M", "J", "J", "A", "S", "O", "N", "D"];
+function pad2(n) { return (n < 10 ? "0" : "") + n; }
+
+/* ── Telemetry (Home Mini): Live + Day ────────────────────────────────────── */
+function fetchTelemetry(deviceId, grouping, start, end) {
+  var q = 'query { smartMeterTelemetry(deviceId:"' + deviceId + '", grouping:' + grouping +
+    ', start:"' + start.toISOString() + '", end:"' + end.toISOString() + '"){ readAt demand consumptionDelta costDelta } }';
+  return graphqlQuery(q).then(function (d) {
+    var rows = (d.smartMeterTelemetry || []).slice();
+    rows.sort(function (a, b) { return a.readAt < b.readAt ? -1 : (a.readAt > b.readAt ? 1 : 0); });
+    return rows;
   });
 }
 
-function mockLive() {
-  var out = [], v = 300;
-  for (var i = 0; i < 40; i++) { v += (((i * 37) % 11) - 5) * 20; if (v < 60) v = 60; out.push(v); }
-  return out;
+function loadLive(deviceId) {
+  var end = new Date(), start = new Date(end.getTime() - 30 * 60000);
+  return fetchTelemetry(deviceId, "ONE_MINUTE", start, end).then(function (rows) {
+    var demand = [], wh = 0, latest = 0;
+    for (var i = 0; i < rows.length; i++) {
+      if (rows[i].demand != null) { demand.push(Math.round(Number(rows[i].demand))); latest = Math.round(Number(rows[i].demand)); }
+      if (rows[i].consumptionDelta != null) wh += Number(rows[i].consumptionDelta);
+    }
+    if (!demand.length) return sendReliable({ STATUS: "nodata", LABEL: "LIVE" });
+    // axis: three clock times across the window
+    var t0 = rows[0].readAt, tN = rows[rows.length - 1].readAt;
+    function hm(iso) { return iso.substr(11, 5); }
+    return sendTracks({
+      label: "LIVE  " + Math.round(wh) + " Wh",
+      axis: hm(t0) + "," + hm(rows[Math.floor(rows.length / 2)].readAt) + "," + hm(tN),
+      a: { bars: demand, total: String(latest), unit: "W" }, b: null
+    });
+  });
 }
 
-function loadLive() {
+function loadDay(deviceId) {
+  var end = new Date(), start = startOfToday();
+  return fetchTelemetry(deviceId, "HALF_HOURLY", start, end).then(function (rows) {
+    if (!rows.length) return sendReliable({ STATUS: "nodata", LABEL: "TODAY" });
+    // place into 48 half-hour slots from midnight
+    var kwh = [], cost = [], i;
+    for (i = 0; i < 48; i++) { kwh[i] = 0; cost[i] = 0; }
+    var totKwh = 0, totCost = 0;
+    for (i = 0; i < rows.length; i++) {
+      var iso = rows[i].readAt; // e.g. 2026-06-24T07:30:00+01:00 (already local offset)
+      var hh = parseInt(iso.substr(11, 2), 10), mm = parseInt(iso.substr(14, 2), 10);
+      var slot = hh * 2 + (mm >= 30 ? 1 : 0);
+      var k = (Number(rows[i].consumptionDelta) || 0) / 1000;
+      var c = (Number(rows[i].costDelta) || 0) / 100;
+      if (slot >= 0 && slot < 48) { kwh[slot] += k; cost[slot] += c; }
+      totKwh += k; totCost += c;
+    }
+    var kwhS = [], costS = [];
+    for (i = 0; i < 48; i++) { kwhS.push(fmt(kwh[i], 3)); costS.push(fmt(cost[i], 3)); }
+    return sendTracks({
+      label: "TODAY", axis: "00,06,12,18",
+      a: { bars: kwhS, total: fmt(totKwh, 2), unit: "kWh" },
+      b: { bars: costS, total: fmt(totCost, 2), unit: "GBP" }
+    });
+  });
+}
+
+/* ── Measurements (settled + cost): Week / Month / Year ───────────────────── */
+function fetchMeasurements(freq, start, end) {
+  var q = 'query($acc:String!,$start:DateTime!,$end:DateTime!){ account(accountNumber:$acc){ properties{ ' +
+    'measurements(first:400, startAt:$start, endAt:$end, timezone:"Europe/London", ' +
+    'utilityFilters:{ electricityFilters:{ readingFrequencyType:' + freq + ', readingDirection: CONSUMPTION } }){ ' +
+    'edges{ node{ value ... on IntervalMeasurementType { startAt } ' +
+    'metaData{ statistics{ costInclTax{ estimatedAmount } } } } } } } } }';
+  return graphqlQuery(q, { acc: CONFIG.accountNumber, start: start.toISOString(), end: end.toISOString() }).then(function (d) {
+    var props = (d.account && d.account.properties) || [];
+    var edges = [];
+    for (var p = 0; p < props.length; p++) {
+      var e = props[p].measurements && props[p].measurements.edges;
+      if (e && e.length) { edges = e; break; }
+    }
+    return edges.map(function (e) {
+      var stats = (e.node.metaData && e.node.metaData.statistics) || [];
+      var pence = 0;
+      for (var i = 0; i < stats.length; i++) {
+        if (stats[i].costInclTax && stats[i].costInclTax.estimatedAmount != null) pence += Number(stats[i].costInclTax.estimatedAmount);
+      }
+      return { start: e.node.startAt, kwh: Number(e.node.value) || 0, cost: pence / 100 };
+    });
+  });
+}
+
+// view: "week" | "month" | "year"
+function loadHistory(view) {
+  var now = new Date(), spec;
+  if (view === "week") spec = { freq: "DAY_INTERVAL", start: startOfWeek(), label: "THIS WEEK", axis: "dow" };
+  else if (view === "month") spec = { freq: "DAY_INTERVAL", start: startOfMonth(), label: MO_FULL(now) + " " + now.getFullYear(), axis: "dom" };
+  else spec = { freq: "MONTH_INTERVAL", start: startOfYear(), label: String(now.getFullYear()), axis: "mon" };
+
+  return fetchMeasurements(spec.freq, spec.start, now).then(function (rows) {
+    if (!rows.length) return sendReliable({ STATUS: "nodata", LABEL: spec.label });
+    var kwh = [], cost = [], labels = [], totK = 0, totC = 0;
+    for (var i = 0; i < rows.length; i++) {
+      kwh.push(fmt(rows[i].kwh, 2)); cost.push(fmt(rows[i].cost, 2));
+      totK += rows[i].kwh; totC += rows[i].cost;
+      var dt = rows[i].start;
+      var mo = parseInt(dt.substr(5, 2), 10) - 1, day = parseInt(dt.substr(8, 2), 10);
+      // weekday for week view needs the actual day-of-week; derive from date
+      if (spec.axis === "dow") labels.push(WD[new Date(parseInt(dt.substr(0, 4), 10), mo, day).getDay()]);
+      else if (spec.axis === "mon") labels.push(MO[mo]);
+      else labels.push(String(day)); // dom -> day numbers (watch thins them)
+    }
+    return sendTracks({
+      label: spec.label, axis: labels.join(","),
+      a: { bars: kwh, total: fmt(totK, 1), unit: "kWh" },
+      b: { bars: cost, total: fmt(totC, 2), unit: "GBP" }
+    });
+  });
+}
+function MO_FULL(d) { return ["JAN","FEB","MAR","APR","MAY","JUN","JUL","AUG","SEP","OCT","NOV","DEC"][d.getMonth()]; }
+
+/* ── Mock data (useMock) ──────────────────────────────────────────────────── */
+function mockSeq(n, base, spread) { var a = []; for (var i = 0; i < n; i++) a.push(base + ((i * 7) % 5) * spread); return a; }
+function loadMock(view) {
+  if (view === "live") {
+    var d = mockSeq(30, 250, 90).map(function (x) { return String(Math.round(x)); });
+    return sendTracks({ label: "LIVE  180 Wh (mock)", axis: "12:00,12:15,12:30", a: { bars: d, total: "265", unit: "W" }, b: null });
+  }
+  var specs = { day: [48, "00,06,12,18", "TODAY (mock)"], week: [7, "M,T,W,T,F,S,S", "THIS WEEK (mock)"],
+    month: [30, "1,8,15,22,29", "JUN (mock)"], year: [12, "J,F,M,A,M,J,J,A,S,O,N,D", "2026 (mock)"] };
+  var s = specs[view] || specs.day;
+  var k = mockSeq(s[0], 0.3, 0.25), kS = [], cS = [], tk = 0, tc = 0;
+  for (var i = 0; i < k.length; i++) { kS.push(fmt(k[i], 3)); cS.push(fmt(k[i] * 0.28, 3)); tk += k[i]; tc += k[i] * 0.28; }
+  return sendTracks({ label: s[2], axis: s[1],
+    a: { bars: kS, total: fmt(tk, 2), unit: "kWh" }, b: { bars: cS, total: fmt(tc, 2), unit: "GBP" } });
+}
+
+/* ── Dispatch ─────────────────────────────────────────────────────────────── */
+var inFlight = false;
+function load(view) {
   if (inFlight) return;
   inFlight = true;
   function finish() { inFlight = false; }
 
-  if (CONFIG.useMock) { sendLive(mockLive()).then(finish, finish); return; }
-  if (!CONFIG.apiKey || !CONFIG.accountNumber) {
-    sendReliable({ STATUS: "error", ERROR: "Set API key in pkjs" }).then(finish, finish);
-    return;
-  }
+  if (CONFIG.useMock) { loadMock(view).then(finish, finish); return; }
+  if (!CONFIG.apiKey || !CONFIG.accountNumber) { sendReliable({ STATUS: "error", ERROR: "Set API key" }).then(finish, finish); return; }
+  sendOnce({ STATUS: "loading" }).catch(function () {}); // primes the session
 
-  getDevice().then(function (deviceId) {
-    var q = 'query { smartMeterTelemetry(deviceId: "' + deviceId + '", grouping: TEN_SECONDS, ' +
-            'start: "' + isoMinutesAgo(8) + '", end: "' + new Date().toISOString() + '") ' +
-            '{ readAt demand } }';
-    return graphqlQuery(q);
-  }).then(function (data) {
-    var rows = data.smartMeterTelemetry || [];
-    // Sort oldest→newest by readAt and keep readings that report demand.
-    rows.sort(function (a, b) { return (a.readAt < b.readAt) ? -1 : (a.readAt > b.readAt ? 1 : 0); });
-    var demand = [];
-    for (var i = 0; i < rows.length; i++) {
-      if (rows[i].demand !== null && rows[i].demand !== undefined) demand.push(Number(rows[i].demand));
-    }
-    console.log("octopus: live rows=" + rows.length + " withDemand=" + demand.length);
-    return sendLive(demand);
-  }).catch(function (e) {
-    return sendReliable({ STATUS: "error", ERROR: String((e && e.message) || e) });
-  }).then(finish, finish);
+  var work;
+  if (view === "live" || view === "day") work = getDevice().then(function (id) { return view === "live" ? loadLive(id) : loadDay(id); });
+  else work = loadHistory(view);
+
+  work.catch(function (e) { return sendReliable({ STATUS: "error", ERROR: String((e && e.message) || e) }); }).then(finish, finish);
 }
 
 /* ── Wiring ───────────────────────────────────────────────────────────────── */
 Pebble.addEventListener("ready", function () {
-  console.log("octopus: pkjs ready mock=" + CONFIG.useMock +
-    " account=" + (CONFIG.accountNumber || "(none)") +
-    " key=" + (CONFIG.apiKey ? "set" : "(none)"));
-  // Drive the initial load (default view = live). sendReliable retries until the
-  // watch's channel is open. Once the watch has received this, it can send its
-  // own requests (poll/refresh/switch).
-  loadLive();
+  console.log("octopus: pkjs ready mock=" + CONFIG.useMock + " account=" + (CONFIG.accountNumber || "(none)") + " key=" + (CONFIG.apiKey ? "set" : "(none)"));
+  load("live"); // default view; drives the initial push (retried until the watch channel opens)
 });
-
 Pebble.addEventListener("appmessage", function (e) {
-  // Only act on explicit view requests; ignore the empty handshake message.
   var req = e.payload && e.payload.REQUEST;
-  if (req === "live") loadLive();
-  else if (req === "day" || req === "week" || req === "month" || req === "year") loadHistory(req);
+  if (req === "live" || req === "day" || req === "week" || req === "month" || req === "year") load(req);
 });
 
-/* ── Settings page (on-phone configuration) ───────────────────────────────────
- * Self-contained page (a data: URL, so no hosting needed). Saving writes to
- * localStorage "settings", which loadConfig() treats as highest priority — the
- * same layer a future Clay page would use. The API key stays on the phone.
- */
-function esc(s) {
-  return String(s == null ? "" : s).replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;");
-}
-
+/* ── Settings page (on-phone configuration) ───────────────────────────────── */
+function esc(s) { return String(s == null ? "" : s).replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;"); }
 function buildConfigPage(cur) {
-  var html =
-    '<!DOCTYPE html><html><head><meta charset="utf-8">' +
+  var html = '<!DOCTYPE html><html><head><meta charset="utf-8">' +
     '<meta name="viewport" content="width=device-width,initial-scale=1">' +
     '<style>body{font-family:-apple-system,Roboto,sans-serif;background:#140a2c;color:#fff;margin:0;padding:20px}' +
     'h2{color:#e850d0}label{display:block;margin:16px 0 4px;font-size:14px;color:#b99ad6}' +
     'input[type=text]{width:100%;box-sizing:border-box;padding:10px;border-radius:8px;border:1px solid #402c60;' +
     'background:#1f1140;color:#fff;font-size:16px}.row{display:flex;align-items:center;margin-top:16px}' +
     '.row input{margin-right:8px}button{margin-top:24px;width:100%;padding:14px;border:0;border-radius:24px;' +
-    'background:#7b5cff;color:#fff;font-size:16px;font-weight:bold}a{color:#e850d0}</style></head><body>' +
+    'background:#7b5cff;color:#fff;font-size:16px;font-weight:bold}</style></head><body>' +
     '<h2>⚡ Octopus Energy</h2>' +
     '<label>API key</label><input type="text" id="apiKey" value="' + esc(cur.apiKey) + '" placeholder="sk_live_…">' +
     '<label>Account number</label><input type="text" id="accountNumber" value="' + esc(cur.accountNumber) + '" placeholder="A-AB1234CD">' +
     '<div class="row"><input type="checkbox" id="useMock"' + (cur.useMock ? " checked" : "") + '><label style="margin:0">Use demo data</label></div>' +
     '<button onclick="save()">Save</button>' +
-    '<p style="font-size:12px;color:#9a7fc0">Get your API key from your Octopus dashboard → Developer settings → API access.</p>' +
+    '<p style="font-size:12px;color:#9a7fc0">API key: Octopus dashboard → Developer settings → API access.</p>' +
     '<script>function save(){var d={apiKey:document.getElementById("apiKey").value.trim(),' +
     'accountNumber:document.getElementById("accountNumber").value.trim(),' +
     'useMock:document.getElementById("useMock").checked};' +
-    'document.location="pebblejs://close#"+encodeURIComponent(JSON.stringify(d));}</script>' +
-    '</body></html>';
+    'document.location="pebblejs://close#"+encodeURIComponent(JSON.stringify(d));}</script></body></html>';
   return "data:text/html," + encodeURIComponent(html);
 }
-
-Pebble.addEventListener("showConfiguration", function () {
-  console.log("octopus: showConfiguration -> opening settings page");
-  Pebble.openURL(buildConfigPage(CONFIG));
-});
-
+Pebble.addEventListener("showConfiguration", function () { Pebble.openURL(buildConfigPage(CONFIG)); });
 Pebble.addEventListener("webviewclosed", function (e) {
-  if (!e || !e.response) return; // user cancelled
+  if (!e || !e.response) return;
   var data;
   try { data = JSON.parse(decodeURIComponent(e.response)); } catch (err) { return; }
-
   var settings = { useMock: !!data.useMock };
   if (typeof data.apiKey === "string") settings.apiKey = data.apiKey;
   if (typeof data.accountNumber === "string") settings.accountNumber = data.accountNumber;
   localStorage.setItem("settings", JSON.stringify(settings));
-
-  // Account/key may have changed — drop cached lookups and tokens.
-  localStorage.removeItem("meter_v2");
   localStorage.removeItem("device_v1");
   krakenToken = null;
   CONFIG = loadConfig();
-  console.log("octopus: settings saved mock=" + CONFIG.useMock +
-    " account=" + (CONFIG.accountNumber || "(none)") + " key=" + (CONFIG.apiKey ? "set" : "(none)"));
-
-  loadLive(); // refresh with the new settings (watch re-syncs on its next poll too)
+  load("live");
 });

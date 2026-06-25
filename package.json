@@ -23,10 +23,14 @@
       "REQUEST",
       "STATUS",
       "LABEL",
-      "TOTAL",
-      "UNIT",
-      "BARS",
-      "ERROR"
+      "AXIS",
+      "ERROR",
+      "A_BARS",
+      "A_TOTAL",
+      "A_UNIT",
+      "B_BARS",
+      "B_TOTAL",
+      "B_UNIT"
     ],
     "resources": {
       "media": []
