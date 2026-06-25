@@ -146,7 +146,7 @@ function buildLive(deviceId) {
       if (rows[i].consumptionDelta != null) wh += Number(rows[i].consumptionDelta);
     }
     if (!demand.length) return { nodata: "LIVE" };
-    function hm(iso) { return iso.substr(11, 5); }
+    function hm(iso) { var d = new Date(iso); function p(n) { return (n < 10 ? "0" : "") + n; } return p(d.getHours()) + ":" + p(d.getMinutes()); }
     return { p: {
       label: "LIVE  " + Math.round(wh) + " Wh",
       axis: hm(rows[0].readAt) + "," + hm(rows[Math.floor(rows.length / 2)].readAt) + "," + hm(rows[rows.length - 1].readAt),
@@ -155,14 +155,16 @@ function buildLive(deviceId) {
   });
 }
 function buildDay(deviceId) {
-  return fetchTelemetry(deviceId, "HALF_HOURLY", startOfToday(), new Date()).then(function (rows) {
+  var start = startOfToday(), startMs = start.getTime();
+  return fetchTelemetry(deviceId, "HALF_HOURLY", start, new Date()).then(function (rows) {
     if (!rows.length) return { nodata: "TODAY" };
     var kwh = [], cost = [], i;
     for (i = 0; i < 48; i++) { kwh[i] = 0; cost[i] = 0; }
     var totKwh = 0, totCost = 0;
     for (i = 0; i < rows.length; i++) {
-      var iso = rows[i].readAt;
-      var slot = parseInt(iso.substr(11, 2), 10) * 2 + (parseInt(iso.substr(14, 2), 10) >= 30 ? 1 : 0);
+      // Bucket by offset from local midnight, so UTC timestamps land in the right
+      // half-hour (the raw-hour parse pushed pre-dawn BST usage to the far right).
+      var slot = Math.floor((new Date(rows[i].readAt).getTime() - startMs) / 1800000);
       var k = (Number(rows[i].consumptionDelta) || 0) / 1000, c = (Number(rows[i].costDelta) || 0) / 100;
       if (slot >= 0 && slot < 48) { kwh[slot] += k; cost[slot] += c; }
       totKwh += k; totCost += c;
