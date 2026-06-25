@@ -29,7 +29,8 @@ let state = {
   a: { bars: [], total: "", unit: "" },
   b: null                         // { bars, total, unit } or null
 };
-let track = "a";                  // active display track (persists across views)
+let track = "a";                  // active display track: "a"=kWh/W, "b"=£
+try { if (localStorage.getItem("unit") === "b") track = "b"; } catch (e) {} // restore last choice
 
 const VIEWS = ["live", "day", "week", "month", "year"];
 let view = "live";
@@ -192,8 +193,12 @@ new Button({
   onPush(down, type) {
     if (!down) return;
     if (type === "select") {
-      // toggle £/kWh on views that have a cost track
-      if (state.b) { track = (track === "a") ? "b" : "a"; draw(); }
+      // toggle £/kWh on views that have a cost track, and remember the choice
+      if (state.b) {
+        track = (track === "a") ? "b" : "a";
+        try { localStorage.setItem("unit", track); } catch (e) {}
+        draw();
+      }
     } else {
       let i = VIEWS.indexOf(view);
       i = (i + (type === "up" ? -1 : 1) + VIEWS.length) % VIEWS.length;
