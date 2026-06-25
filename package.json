@@ -33,7 +33,14 @@
       "B_UNIT"
     ],
     "resources": {
-      "media": []
+      "media": [
+        {
+          "type": "bitmap",
+          "name": "IMAGE_MENU_ICON",
+          "file": "menu_icon.png",
+          "menuIcon": true
+        }
+      ]
     }
   }
 }
