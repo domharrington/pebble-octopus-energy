@@ -273,8 +273,9 @@ function load(view) {
   if (inFlight) return;
   inFlight = true;
   fetchView(view).then(function (r) {
-    if (r.nodata) { if (!cache[view]) sendReliable({ STATUS: "nodata", LABEL: r.nodata }); return; }
+    if (r.nodata) { if (!cache[view]) sendReliable({ STATUS: "nodata", LABEL: r.nodata, VIEW: view }); return; }
     var msg = tracksMsg(r.p);
+    msg.VIEW = view; // so the watch caches/matches it to the right view
     cache[view] = { msg: msg, at: Date.now() };
     sendReliable(msg);
   }).catch(function (e) {
@@ -285,7 +286,8 @@ function load(view) {
 /* ── Wiring ───────────────────────────────────────────────────────────────── */
 Pebble.addEventListener("ready", function () {
   console.log("octopus: pkjs ready mock=" + CONFIG.useMock + " account=" + (CONFIG.accountNumber || "(none)") + " key=" + (CONFIG.apiKey ? "set" : "(none)"));
-  load("live");
+  // Prime the AppMessage session; the watch then requests its remembered view.
+  sendReliable({ STATUS: "loading" });
 });
 Pebble.addEventListener("appmessage", function (e) {
   var req = e.payload && e.payload.REQUEST;

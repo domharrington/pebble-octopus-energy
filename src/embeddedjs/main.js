@@ -31,9 +31,11 @@ let state = {
 };
 let track = "a";                  // active display track: "a"=kWh/W, "b"=£
 try { if (localStorage.getItem("unit") === "b") track = "b"; } catch (e) {} // restore last choice
+const viewCache = {};             // view -> last payload, for instant (flash-free) switches
 
 const VIEWS = ["live", "day", "week", "month", "year"];
 let view = "live";
+try { const sv = localStorage.getItem("view"); if (sv && VIEWS.indexOf(sv) >= 0) view = sv; } catch (e) {} // restore last view
 let canSend = false;
 let requested = false;            // have we made the initial request this session?
 let started = false;
@@ -152,38 +154,55 @@ function scheduleLivePoll() {
     scheduleLivePoll();
   }, LIVE_INTERVAL_MS);
 }
+function applyPayload(pl) {
+  state.status = "ok";
+  state.label = pl.label;
+  state.axis = pl.axis;
+  state.a = pl.a;
+  state.b = pl.b;
+  draw();
+}
+
 function setView(v) {
   view = v;
-  state.status = "loading";
-  state.a = { bars: [], total: "", unit: "" };
-  state.b = null;
-  draw();
+  try { localStorage.setItem("view", v); } catch (e) {} // remember across launches
+  if (viewCache[v]) applyPayload(viewCache[v]);   // show last-known instantly; revalidate below
+  else { state.status = "loading"; state.a = { bars: [], total: "", unit: "" }; state.b = null; draw(); }
   requestView(v);
   if (v === "live") scheduleLivePoll(); else clearLiveTimer();
 }
 
 const message = new Message({
-  keys: ["REQUEST", "STATUS", "LABEL", "AXIS", "ERROR", "A_BARS", "A_TOTAL", "A_UNIT", "B_BARS", "B_TOTAL", "B_UNIT"],
+  keys: ["REQUEST", "STATUS", "LABEL", "AXIS", "ERROR", "A_BARS", "A_TOTAL", "A_UNIT", "B_BARS", "B_TOTAL", "B_UNIT", "VIEW"],
   onReadable() {
     canSend = true;
     const m = this.read();
     const status = m.get("STATUS");
-    if (status) state.status = status;
-    if (m.has("LABEL")) state.label = m.get("LABEL");
-    if (status === "error") state.label = m.get("ERROR") || "error";
+    const v = m.has("VIEW") ? m.get("VIEW") : null; // which view this payload is for
     if (status === "ok") {
-      state.axis = (m.get("AXIS") || "").split(",").filter(function (s) { return s.length; });
-      state.a = { bars: csv(m.get("A_BARS")), total: m.get("A_TOTAL") || "", unit: m.get("A_UNIT") || "" };
-      state.b = m.has("B_BARS") ? { bars: csv(m.get("B_BARS")), total: m.get("B_TOTAL") || "", unit: m.get("B_UNIT") || "" } : null;
+      const pl = {
+        label: m.get("LABEL") || "",
+        axis: (m.get("AXIS") || "").split(",").filter(function (s) { return s.length; }),
+        a: { bars: csv(m.get("A_BARS")), total: m.get("A_TOTAL") || "", unit: m.get("A_UNIT") || "" },
+        b: m.has("B_BARS") ? { bars: csv(m.get("B_BARS")), total: m.get("B_TOTAL") || "", unit: m.get("B_UNIT") || "" } : null
+      };
+      if (v) viewCache[v] = pl;
+      if (!v || v === view) { applyPayload(pl); clearRetry(); } // ignore replies for other views
+    } else if (status === "nodata" || status === "error") {
+      if (!v || v === view) {
+        state.status = status;
+        state.label = (status === "error") ? (m.get("ERROR") || "error") : (m.get("LABEL") || "");
+        clearRetry();
+        draw();
+      }
     }
-    if (status === "ok" || status === "nodata" || status === "error") clearRetry();
-    draw();
+    // status "loading" (session prime): leave the current display as-is.
     if (!started) { started = true; if (view === "live") scheduleLivePoll(); }
+    // Receiving anything proves the channel is open — request our view once.
+    if (!requested) { requested = true; requestView(view); }
   },
   onWritable() {
     canSend = true;
-    // Channel is open: make the initial request once (covers app launch/re-entry,
-    // where the phone may already be running and won't push on its own).
     if (!requested) { requested = true; requestView(view); }
   }
 });

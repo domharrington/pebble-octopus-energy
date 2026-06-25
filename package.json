@@ -30,7 +30,8 @@
       "A_UNIT",
       "B_BARS",
       "B_TOTAL",
-      "B_UNIT"
+      "B_UNIT",
+      "VIEW"
     ],
     "resources": {
       "media": [
