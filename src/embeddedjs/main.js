@@ -34,8 +34,11 @@ let track = "a";                  // active display track (persists across views
 const VIEWS = ["live", "day", "week", "month", "year"];
 let view = "live";
 let canSend = false;
+let requested = false;            // have we made the initial request this session?
 let started = false;
 let liveTimer = null;
+let retryTimer = null;
+let retries = 0;
 const LIVE_INTERVAL_MS = 30000;
 
 function csv(s) {
@@ -86,10 +89,11 @@ function draw() {
 
   render.fillRectangle(C_GRID, padX, chartBottom, chartW, 1);
 
+  // Fixed-period views are padded to full slots by the phone, so fill the width
+  // left-aligned (e.g. Week = Mon..Sun, each bar in its day slot like the app).
   const n = bars.length || 1;
-  const slot = Math.min(chartW / n, 18);
-  const groupW = slot * n;
-  const chartX = padX + (chartW - groupW) / 2;
+  const slot = chartW / n;
+  const chartX = padX;
   const barW = Math.max(1, Math.floor(slot) - 1);
   for (let i = 0; i < bars.length; i++) {
     const h = Math.round((bars[i] / max) * chartH);
@@ -97,14 +101,15 @@ function draw() {
     render.fillRectangle(C_BAR, Math.round(chartX + i * slot), chartBottom - h, barW, h);
   }
 
-  /* Axis labels (from the phone). Align 1:1 to bars when counts match,
-     else spread evenly; thin to at most ~7 labels. */
+  /* Axis labels (from the phone). One label per bar -> centre under each bar;
+     otherwise spread across. Thin to at most ~7. */
   const labels = state.axis;
   if (labels && labels.length) {
     const aligned = labels.length === bars.length;
     const step = Math.max(1, Math.ceil(labels.length / 7));
     for (let k = 0; k < labels.length; k += step) {
-      const x = aligned ? chartX + k * slot : chartX + (k / labels.length) * groupW;
+      const lw = render.getTextWidth(labels[k], fSmall);
+      const x = aligned ? chartX + (k + 0.5) * slot - lw / 2 : chartX + (k / labels.length) * chartW;
       render.drawText(labels[k], fSmall, C_MUTED, Math.round(x), chartBottom + 1);
     }
   }
@@ -112,12 +117,30 @@ function draw() {
 }
 
 /* ── Phone link ───────────────────────────────────────────────────────────── */
-function requestView(v) {
+function sendReq(v) {
   if (!canSend) return;
   const m = new Map();
   m.set("REQUEST", v);
   message.write(m);
 }
+// Request a view and watch for a reply; re-ask if nothing arrives. This is what
+// recovers a fresh app launch / re-entry, where the phone may not push on its own.
+function requestView(v) {
+  retries = 0;
+  sendReq(v);
+  armRetry();
+}
+function armRetry() {
+  if (retryTimer) clearTimeout(retryTimer);
+  retryTimer = setTimeout(function () {
+    retryTimer = null;
+    if (state.status !== "loading") return;   // a reply landed
+    if (retries++ >= 4) return;                // give up after ~20s
+    sendReq(view);
+    armRetry();
+  }, 4000);
+}
+function clearRetry() { if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; } }
 function clearLiveTimer() { if (liveTimer) { clearTimeout(liveTimer); liveTimer = null; } }
 function scheduleLivePoll() {
   clearLiveTimer();
@@ -152,10 +175,16 @@ const message = new Message({
       state.a = { bars: csv(m.get("A_BARS")), total: m.get("A_TOTAL") || "", unit: m.get("A_UNIT") || "" };
       state.b = m.has("B_BARS") ? { bars: csv(m.get("B_BARS")), total: m.get("B_TOTAL") || "", unit: m.get("B_UNIT") || "" } : null;
     }
+    if (status === "ok" || status === "nodata" || status === "error") clearRetry();
     draw();
     if (!started) { started = true; if (view === "live") scheduleLivePoll(); }
   },
-  onWritable() { canSend = true; }
+  onWritable() {
+    canSend = true;
+    // Channel is open: make the initial request once (covers app launch/re-entry,
+    // where the phone may already be running and won't push on its own).
+    if (!requested) { requested = true; requestView(view); }
+  }
 });
 
 new Button({
