@@ -65,12 +65,33 @@ lags ~24–48h, so the Day view shows the most recent day that has data.
 
 ## Building & running
 
+A `Makefile` wraps the common commands (run `make` for the list):
+
 ```sh
-pebble build                       # build for all target platforms
-pebble install --emulator emery    # run in the Pebble Time 2 emulator
-pebble install --phone <ip>        # install to a paired phone
-pebble logs                        # view watch + pkjs console output
+make run                 # build + launch the Pebble Time 2 (emery) emulator
+make logs                # stream watch + pkjs logs
+make config              # open the Settings page in the emulator
+make deploy PHONE=<ip>   # install onto your real watch (see below)
 ```
+
+`pebble` itself comes from the SDK (`uv tool install pebble-tool`) and lives in
+`~/.local/bin` — make sure that's on your `PATH`.
+
+## Deploying to your Pebble Time 2
+
+The watch installs over Bluetooth via your phone:
+
+1. Install the **Pebble** companion app (Core Devices / Rebble) and pair your
+   Time 2.
+2. In the app, enable the **Developer Connection** — it shows your phone's IP.
+3. Put your computer and phone on the **same Wi-Fi**, then:
+   ```sh
+   make deploy PHONE=192.168.1.42      # your phone's IP
+   ```
+   (equivalently `pebble install --phone <ip> --logs`). The app appears in the
+   watch's app list with the octopus icon.
+4. Set your API key / account number on the watch via the companion app's
+   **Settings** (gear icon), or bake them into `config.local.js` before building.
 
 ## Roadmap
 
