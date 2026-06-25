@@ -1,53 +1,61 @@
 # Octopus Energy for Pebble
 
-A Pebble **watchapp** (not a watchface) that shows your home electricity usage as
-a bar chart, using the [Octopus Energy API](https://developer.octopus.energy/).
-Built with **Alloy** (Pebble's JavaScript framework, powered by Moddable XS).
+A Pebble **watchapp** (not a watchface) that shows your home electricity usage —
+live power plus historical kWh and **£ cost** — using the Octopus Energy
+[Kraken GraphQL API](https://developer.octopus.energy/). Built with **Alloy**
+(Pebble's JavaScript framework, powered by Moddable XS).
 
 Targets **emery** (Pebble Time 2) and **gabbro** (Pebble Round 2).
 
 ## Views & controls
 
-- **Live** — near-real-time watts from your Octopus **Home Mini** (GraphQL
-  `smartMeterTelemetry`), polled every ~30s *only while this view is open*.
-- **Day** — most recent day of hourly consumption (kWh). The REST feed lags
-  ~24–48h, so the latest day with data is shown, labelled with its date.
-- **Week / Month / Year** — kWh aggregated by day (week, month) or by month
-  (year), via the REST `group_by` parameter.
+- **Live** — near-real-time watts from your Octopus **Home Mini**
+  (`smartMeterTelemetry`, 1-minute over the last 30 min), with Wh used and a
+  time axis. Polled every ~30s *only while this view is open*.
+- **Day** — today so far, half-hourly (telemetry, fresh).
+- **Week / Month / Year** — this week (Mon–Sun), this month, this year, via the
+  `measurements` query (one call each).
 
-Buttons: **UP/DOWN** cycle through the views · **SELECT** refreshes · **BACK** exits
-(which also stops live polling — its timer dies with the app).
+Every energy view carries **both kWh and £**.
 
-## Settings
-
-The app is **configurable** from the phone's Pebble app (gear icon → Settings).
-The page collects your API key, account number, and a demo-data toggle, and saves
-them to `localStorage` (the highest-priority config layer). The API key stays on
-the phone. The page is a self-contained `data:` URL, so no server is needed.
+Buttons: **UP/DOWN** cycle views · **SELECT** toggles **kWh ⟷ £** · **BACK** exits.
+The app **remembers your last view and kWh/£ choice** across launches.
 
 ## How it works
 
 ```
 src/embeddedjs/main.js   Watch UI — Poco bar chart, view switching, live poll timer
-src/pkjs/index.js        Phone — Octopus REST + GraphQL, normalises, sends to watch
+src/pkjs/index.js        Phone — Kraken GraphQL, normalises, sends to watch
 src/pkjs/config.js       Committed config defaults (no secrets)
 src/pkjs/config.local.js Your personal secrets (gitignored, optional)
+resources/menu_icon.png  App launcher icon (octopus)
 ```
 
 The phone side (`pkjs`) does all networking — **your API key never reaches the
-watch**. It distils the response to ~24 numbers and sends them over App Messages;
-the watch just draws.
+watch**. Per view it sends two compact series (kWh + £); the watch draws one and
+**SELECT toggles** between them instantly. Data sources:
+
+- **Live / Day** → `smartMeterTelemetry` (Home Mini — fresh, includes cost)
+- **Week / Month / Year** → `measurements` (DAY/DAY/MONTH interval — includes cost)
+
+**Per-view caching:** switching to a recently-seen view is served instantly; a
+stale view is shown immediately and refreshed in the background (TTLs: Live 15s,
+Day 5m, Week 15m, Month 30m, Year 60m).
+
+## Settings
+
+The app is **configurable** from the phone's Pebble app (gear icon → Settings):
+API key, account number, and a demo-data toggle. It saves to `localStorage`
+(highest-priority config layer); the API key stays on the phone. The page is a
+self-contained `data:` URL, so no server is needed.
 
 ## Configuration
 
 Credentials resolve in this order (later layers win):
 
-1. **`config.js`** — committed defaults. Ships with `useMock: true` so the app
-   renders synthetic data with no credentials.
-2. **`config.local.js`** — your personal keys, gitignored. This is the
-   "local secrets" file for personal builds.
-3. **`localStorage["settings"]`** — written by an on-phone Settings page in a
-   future distributed build (see Roadmap).
+1. **`config.js`** — committed defaults (`useMock: true`, renders demo data).
+2. **`config.local.js`** — your personal keys, gitignored.
+3. **`localStorage["settings"]`** — written by the on-phone Settings page.
 
 ### Personal setup
 
@@ -56,42 +64,42 @@ cp src/pkjs/config.local.example.js src/pkjs/config.local.js
 # edit config.local.js: set apiKey, accountNumber, useMock: false
 ```
 
-- **apiKey** — Octopus Dashboard → Developer settings → API access (`sk_live_…`)
+- **apiKey** — Octopus dashboard → Developer settings → API access (`sk_live_…`)
 - **accountNumber** — e.g. `A-AB1234CD`
 
-The app auto-discovers your MPAN + meter serial (and Home Mini device ID) from
-the account; export/solar meter-points are skipped. The REST consumption feed
-lags ~24–48h, so the Day view shows the most recent day that has data.
+The app auto-discovers your Home Mini device, MPAN and meter from the account
+(export/solar meter-points are skipped).
 
 ## Building & running
 
 A `Makefile` wraps the common commands (run `make` for the list):
 
 ```sh
-make run                 # build + launch the Pebble Time 2 (emery) emulator
-make logs                # stream watch + pkjs logs
-make config              # open the Settings page in the emulator
-make deploy PHONE=<ip>   # install onto your real watch (see below)
+make run     # build + launch the Pebble Time 2 (emery) emulator with logs
+make logs    # stream watch + pkjs logs
+make config  # open the Settings page in the emulator
+make pbw     # build the .pbw and reveal it for sideloading (no cloud)
+make deploy  # install to your watch via the CloudPebble dev connection
 ```
 
-`pebble` itself comes from the SDK (`uv tool install pebble-tool`) and lives in
+`pebble` comes from the SDK (`uv tool install pebble-tool`) and lives in
 `~/.local/bin` — make sure that's on your `PATH`.
 
 ## Deploying to your Pebble Time 2
 
-The watch installs over Bluetooth via your phone:
+Installs go to the watch **over Bluetooth via your phone** (the phone is also
+needed at runtime — the API calls run in PebbleKit JS on the phone). USB is
+charge-only and can't install apps.
 
-1. Install the **Pebble** companion app (Core Devices / Rebble) and pair your
-   Time 2.
-2. In the app, enable the **Developer Connection** — it shows your phone's IP.
-3. Put your computer and phone on the **same Wi-Fi**, then:
-   ```sh
-   make deploy PHONE=192.168.1.42      # your phone's IP
-   ```
-   (equivalently `pebble install --phone <ip> --logs`). The app appears in the
-   watch's app list with the octopus icon.
-4. Set your API key / account number on the watch via the companion app's
-   **Settings** (gear icon), or bake them into `config.local.js` before building.
+- **No cloud — sideload the `.pbw`:** `make pbw`, then get `build/octopus.pbw`
+  onto your phone (AirDrop; on Android use Rebble's *Sideload Helper*) and open
+  it in the Pebble app. No login/IP needed.
+- **CloudPebble dev connection** (live install + logs): enable **Dev Connection**
+  in the app (Devices → ⋯), `make login` once, then `make deploy`.
+- **Local Wi-Fi** (only if the app shows a Server IP): `make deploy-ip PHONE=<ip>`.
+
+Set your API key / account number via the app's **Settings**, or bake them into
+`config.local.js` before building.
 
 ## Roadmap
 
